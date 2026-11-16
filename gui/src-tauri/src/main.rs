@@ -89,13 +89,58 @@ fn show_main(app: &AppHandle) {
     }
 }
 
+/// Read-only receiver/transmitter RF connection state, as reported by v2
+/// status bitmask offset 44 (or v1 TX slots). This is NOT a power-control API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RfLinkState {
+    Unknown,
+    NoTransmitters,
+    Tx1,
+    Tx2,
+    Both,
+}
+
+impl RfLinkState {
+    fn from_connections(tx1: bool, tx2: bool) -> Self {
+        match (tx1, tx2) {
+            (false, false) => Self::NoTransmitters,
+            (true, false) => Self::Tx1,
+            (false, true) => Self::Tx2,
+            (true, true) => Self::Both,
+        }
+    }
+
+    fn display(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown (receiver status unavailable)",
+            Self::NoTransmitters => "No transmitters connected",
+            Self::Tx1 => "TX1 connected",
+            Self::Tx2 => "TX2 connected",
+            Self::Both => "TX1 + TX2 connected",
+        }
+    }
+}
+
+#[cfg(test)]
+mod rf_link_tests {
+    use super::RfLinkState;
+
+    #[test]
+    fn decodes_all_tx_presence_combinations() {
+        assert_eq!(RfLinkState::from_connections(false, false), RfLinkState::NoTransmitters);
+        assert_eq!(RfLinkState::from_connections(true, false), RfLinkState::Tx1);
+        assert_eq!(RfLinkState::from_connections(false, true), RfLinkState::Tx2);
+        assert_eq!(RfLinkState::from_connections(true, true), RfLinkState::Both);
+    }
+}
+
 /// What the tray menu reflects: whether to show the per-device toggles (exactly
 /// one mic connected), the current NC mode, NC power, LED state, the connected
 /// device's protocol version, and whether "Start at login" is enabled.
 /// Compared each tick so the menu is only rebuilt on change.
 type MenuState = (
     bool, Option<String>, Option<String>, Option<String>, Option<u8>,
-    Option<i8>, idle::IdlePhase, String, bool,
+    Option<i8>, RfLinkState, idle::IdlePhase, String, bool,
 );
 
 /// Read the current menu-relevant state.
@@ -104,7 +149,7 @@ fn menu_state(app: &AppHandle) -> MenuState {
     let (phase, detail) = app.state::<Arc<idle::IdleMonitor>>().inner().reading();
     let mgr = app.state::<Arc<DeviceManager>>().inner().clone();
     if mgr.list().len() != 1 {
-        return (false, None, None, None, None, None, phase, detail, autostart);
+        return (false, None, None, None, None, None, RfLinkState::Unknown, phase, detail, autostart);
     }
     match pick_device(&mgr).and_then(|id| mgr.status(&id).ok()) {
         Some(st) => (
@@ -114,18 +159,23 @@ fn menu_state(app: &AppHandle) -> MenuState {
             st.settings.get("mic-leds").cloned(),
             st.protocol_version,
             st.gain_dial,
+            if st.connected {
+                RfLinkState::from_connections(st.tx[0].is_some(), st.tx[1].is_some())
+            } else {
+                RfLinkState::Unknown
+            },
             phase,
             detail,
             autostart,
         ),
-        None => (true, None, None, None, None, None, phase, detail, autostart),
+        None => (true, None, None, None, None, None, RfLinkState::Unknown, phase, detail, autostart),
     }
 }
 
 /// Build the tray menu. The per-device toggles appear only when exactly one mic
 /// is connected, and their labels show the current mode and what tapping does.
 fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
-    let (show, nc, nc_power, led, protocol_version, gain, phase, detail, autostart) = state;
+    let (show, nc, nc_power, led, protocol_version, gain, rf, phase, detail, autostart) = state;
     let open = MenuItem::with_id(app, "open", "Open DJI Mic Control", true, None::<&str>)?;
     let startup = CheckMenuItem::with_id(
         app,
@@ -145,6 +195,12 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         idle::IdlePhase::Due => format!("Idle test: {}s reached (NO power-off)", idle::timeout_seconds()),
     };
     let idle_item = MenuItem::with_id(app, "idle-monitor", idle_label, false, None::<&str>)?;
+    // Read-only by design: no known reversible DJI RF-disable command exists.
+    let rf_item = MenuItem::with_id(
+        app, "rf-link-status",
+        format!("Wireless link (read-only): {}", rf.display()),
+        false, None::<&str>,
+    )?;
 
     if *show {
         let led_label = match led.as_deref() {
@@ -188,10 +244,10 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         if let Some(item) = &nc_power_item {
             items.push(item);
         }
-        items.extend([&sep_b as &dyn IsMenuItem<Wry>, &idle_item, &startup, &sep_c, &quit]);
+        items.extend([&sep_b as &dyn IsMenuItem<Wry>, &rf_item, &idle_item, &startup, &sep_c, &quit]);
         Menu::with_items(app, &items)
     } else {
-        Menu::with_items(app, &[&open, &sep_a, &idle_item, &startup, &sep_b, &quit])
+        Menu::with_items(app, &[&open, &sep_a, &rf_item, &idle_item, &startup, &sep_b, &quit])
     }
 }
 
@@ -618,6 +674,7 @@ fn main() {
             // than only on change.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
+                let mut last_rf = initial.6;
                 let mut last = initial;
                 let mut last_alert = initial_alert;
                 let mut last_mic2 = initial_mic2;
@@ -625,6 +682,13 @@ fn main() {
                 let mut blink_on = true;
                 loop {
                     let state = menu_state(&handle);
+                    let rf = state.6;
+                    if rf != last_rf {
+                        // Log only RF link transitions, not 10Hz audio level updates.
+                        // Does not transmit any USB command or alter pairing.
+                        eprintln!("[DJI RF read-only] {} -> {}", last_rf.display(), rf.display());
+                        last_rf = rf;
+                    }
                     if state != last {
                         last = state.clone();
                         let h = handle.clone();
