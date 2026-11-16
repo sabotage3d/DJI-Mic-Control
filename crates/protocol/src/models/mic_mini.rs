@@ -36,6 +36,15 @@ static NC_OPTS: [SettingOption; 2] = [
     SettingOption { value: "basic", label: "Basic", wire: 0x00 },
     SettingOption { value: "strong", label: "Strong", wire: 0x01 },
 ];
+// Verified DJI Mic Series Mobile RX receiver gain (v2 DUML setting 0x0039).
+// Payload is an i8 dB value reinterpreted as a byte (two's complement).
+static RECEIVER_GAIN_OPTS: [SettingOption; 5] = [
+    SettingOption { value: "-12", label: "-12 dB", wire: 0xf4 },
+    SettingOption { value: "-6", label: "-6 dB", wire: 0xfa },
+    SettingOption { value: "0", label: "0 dB", wire: 0x00 },
+    SettingOption { value: "6", label: "+6 dB", wire: 0x06 },
+    SettingOption { value: "12", label: "+12 dB", wire: 0x0c },
+];
 static NC_POWER_OPTS: [SettingOption; 2] = off_on();
 static NC_BUTTON_OPTS: [SettingOption; 2] = off_on();
 static LOW_CUT_OPTS: [SettingOption; 2] = off_on();
@@ -70,7 +79,20 @@ const G_AUDIO: &str = "Audio";
 const G_POWER: &str = "Power & Startup";
 const G_DEVICE: &str = "Device";
 
-static SETTINGS: [Setting; 13] = [
+static SETTINGS: [Setting; 14] = [
+    Setting {
+        id: "receiver-gain",
+        label: "Receiver Gain",
+        group: G_AUDIO,
+        kind: SettingKind::Enum,
+        // Verified on DJI Mic Series Mobile RX, protocol v2; absent on v1.
+        v1_command: None,
+        v2_command: 0x0039,
+        v2_target: TARGET_RX,
+        options: &RECEIVER_GAIN_OPTS,
+        exclusive_with: &[],
+        note: None,
+    },
     Setting {
         id: "noise-cancel",
         label: "Noise Cancel",
@@ -391,7 +413,7 @@ fn decode_v2_status(previous: &DeviceStatus, f: &[u8]) -> Option<DeviceStatus> {
 
     let flags1 = f[20]; // strong-NC 0x08, NC power 0x20, camera-power 0x80
     let flags2 = f[21]; // auto-off (RX) 0x01, stereo 0x04
-    let gain_dial = f[22] as i8; // signed dB, see PROTOCOL.md
+    let gain_dial = f[22] as i8; // Mobile RX receiver gain in signed dB (also reported on v2 status pushes)
     let flags3 = f[48]; // plug-free 0x02, clip limiter 0x10, safety track 0x40
 
     // Low Cut, Mic LEDs, TX Auto Off, and the NC-button permission are purely
@@ -453,6 +475,7 @@ fn decode_v2_status(previous: &DeviceStatus, f: &[u8]) -> Option<DeviceStatus> {
         Some(previous.rx.clone().unwrap_or(RxInfo { serial: None, firmware: None }));
 
     let s = &mut status.settings;
+    s.insert("receiver-gain".into(), gain_dial.to_string());
     s.insert("noise-cancel".into(), bit(flags1 & 0x08 != 0, "strong", "basic"));
     s.insert("noise-cancel-power".into(), on_off(flags1 & 0x20 != 0));
     s.insert("camera-power".into(), on_off(flags1 & 0x80 != 0));
@@ -1060,6 +1083,25 @@ mod tests {
         // Its slot appears on the next tick; identity/level fill in later.
         let after = MicMini.decode(&st, &sample_tx2_only_v2()).expect("decode");
         assert!(after.tx[1].is_some());
+    }
+
+    #[test]
+    fn mobile_rx_gain_uses_verified_v2_command_and_signed_byte() {
+        for (db, wire) in [
+            ("-12", 0xf4u8), ("-6", 0xfau8), ("0", 0x00u8),
+            ("6", 0x06u8), ("12", 0x0cu8),
+        ] {
+            let pkt = MicMini
+                .build_command(7, Dialect::V2, "receiver-gain", db, None)
+                .expect("v2 receiver gain command");
+            assert_eq!(pkt.len(), packet::V2_COMMAND_LEN);
+            assert_eq!(&pkt[12..14], &[0x00, 0x00]); // receiver target
+            assert_eq!(&pkt[16..18], &[0x39, 0x00]); // setting 0x0039 LE
+            assert_eq!(pkt[19], wire); // signed dB as two's complement
+        }
+        assert!(MicMini
+            .build_command(7, Dialect::V1, "receiver-gain", "6", None)
+            .is_none());
     }
 
     #[test]
