@@ -95,16 +95,16 @@ fn show_main(app: &AppHandle) {
 /// Compared each tick so the menu is only rebuilt on change.
 type MenuState = (
     bool, Option<String>, Option<String>, Option<String>, Option<u8>,
-    Option<i8>, idle::IdlePhase, bool,
+    Option<i8>, idle::IdlePhase, String, bool,
 );
 
 /// Read the current menu-relevant state.
 fn menu_state(app: &AppHandle) -> MenuState {
     let autostart = app.autolaunch().is_enabled().unwrap_or(false);
-    let phase = app.state::<Arc<idle::IdleMonitor>>().inner().phase();
+    let (phase, detail) = app.state::<Arc<idle::IdleMonitor>>().inner().reading();
     let mgr = app.state::<Arc<DeviceManager>>().inner().clone();
     if mgr.list().len() != 1 {
-        return (false, None, None, None, None, None, phase, autostart);
+        return (false, None, None, None, None, None, phase, detail, autostart);
     }
     match pick_device(&mgr).and_then(|id| mgr.status(&id).ok()) {
         Some(st) => (
@@ -115,16 +115,17 @@ fn menu_state(app: &AppHandle) -> MenuState {
             st.protocol_version,
             st.gain_dial,
             phase,
+            detail,
             autostart,
         ),
-        None => (true, None, None, None, None, None, phase, autostart),
+        None => (true, None, None, None, None, None, phase, detail, autostart),
     }
 }
 
 /// Build the tray menu. The per-device toggles appear only when exactly one mic
 /// is connected, and their labels show the current mode and what tapping does.
 fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
-    let (show, nc, nc_power, led, protocol_version, gain, phase, autostart) = state;
+    let (show, nc, nc_power, led, protocol_version, gain, phase, detail, autostart) = state;
     let open = MenuItem::with_id(app, "open", "Open DJI Mic Control", true, None::<&str>)?;
     let startup = CheckMenuItem::with_id(
         app,
@@ -138,9 +139,9 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
     let sep_a = PredefinedMenuItem::separator(app)?;
     let sep_b = PredefinedMenuItem::separator(app)?;
     let idle_label = match phase {
-        idle::IdlePhase::Unknown => "Idle test: DJI source / PipeWire unavailable".to_string(),
-        idle::IdlePhase::Active => "Idle test: recording active".to_string(),
-        idle::IdlePhase::Idle => format!("Idle test: waiting ({}s threshold)", idle::timeout_seconds()),
+        idle::IdlePhase::Unknown => format!("Idle test: unknown ({detail})"),
+        idle::IdlePhase::Active => format!("Idle test: in use by {detail}"),
+        idle::IdlePhase::Idle => format!("Idle test: no capture ({}s threshold)", idle::timeout_seconds()),
         idle::IdlePhase::Due => format!("Idle test: {}s reached (NO power-off)", idle::timeout_seconds()),
     };
     let idle_item = MenuItem::with_id(app, "idle-monitor", idle_label, false, None::<&str>)?;

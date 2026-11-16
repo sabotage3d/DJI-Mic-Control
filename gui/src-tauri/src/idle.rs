@@ -1,10 +1,10 @@
 //! Read-only PipeWire capture-activity detection for the DJI Mobile Receiver.
 //!
-//! The test timer never powers down or suspends the hardware. Until we have a
-//! verified reversible command, an automated sleep request could leave a live
-//! call without an input device or force the user to press the TX power button.
+//! The idle test NEVER powers off or disconnects the transmitter. In particular,
+//! a still-open Zoom stream may be a real recording stream even without a meeting.
+//! We report the consumer rather than assuming that a linked device is in use.
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
@@ -18,63 +18,87 @@ pub enum IdlePhase {
     Due,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Probe {
+    Active(Vec<String>),
+    Idle,
+    Unknown(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Reading {
+    phase: IdlePhase,
+    detail: String,
+}
+
 pub struct IdleMonitor {
-    phase: Mutex<IdlePhase>,
+    reading: Mutex<Reading>,
 }
 
 impl IdleMonitor {
     pub fn new() -> Self {
-        Self { phase: Mutex::new(IdlePhase::Unknown) }
+        Self {
+            reading: Mutex::new(Reading {
+                phase: IdlePhase::Unknown,
+                detail: "not checked yet".into(),
+            }),
+        }
     }
 
-    pub fn phase(&self) -> IdlePhase {
-        *self.phase.lock().unwrap_or_else(|p| p.into_inner())
+    /// Current status and the process/stream preventing sleep (when known).
+    pub fn reading(&self) -> (IdlePhase, String) {
+        let reading = self.reading.lock().unwrap_or_else(|p| p.into_inner());
+        (reading.phase, reading.detail.clone())
     }
 
     pub fn run_forever(&self) {
         let mut idle_since: Option<Instant> = None;
         loop {
-            let next = match has_dji_audio_capture() {
-                Ok(true) => {
+            let new_reading = match probe_pipewire() {
+                Ok(Probe::Active(consumers)) => {
                     idle_since = None;
-                    IdlePhase::Active
-                }
-                Ok(false) => {
-                    let since = *idle_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= Duration::from_secs(timeout_seconds()) {
-                        IdlePhase::Due
-                    } else {
-                        IdlePhase::Idle
+                    Reading {
+                        phase: IdlePhase::Active,
+                        detail: consumers.join(", "),
                     }
                 }
-                Err(_) => {
-                    // Fail safe: device missing or PipeWire unavailable is NOT idle.
+                Ok(Probe::Idle) => {
+                    let since = *idle_since.get_or_insert_with(Instant::now);
+                    Reading {
+                        phase: if since.elapsed() >= Duration::from_secs(timeout_seconds()) {
+                            IdlePhase::Due
+                        } else {
+                            IdlePhase::Idle
+                        },
+                        detail: "no application capture streams".into(),
+                    }
+                }
+                Ok(Probe::Unknown(reason)) | Err(reason) => {
+                    // Fail safe: never interpret an uncertain graph as safe to sleep.
                     idle_since = None;
-                    IdlePhase::Unknown
+                    Reading { phase: IdlePhase::Unknown, detail: reason }
                 }
             };
-            let mut phase = self.phase.lock().unwrap_or_else(|p| p.into_inner());
-            if *phase != next {
-                match next {
-                    IdlePhase::Unknown =>
-                        eprintln!("[DJI idle TEST] Unknown: PipeWire unavailable or DJI source absent"),
+            let mut current = self.reading.lock().unwrap_or_else(|p| p.into_inner());
+            if *current != new_reading {
+                match new_reading.phase {
                     IdlePhase::Active =>
-                        eprintln!("[DJI idle TEST] DJI is in use; idle timer reset"),
+                        eprintln!("[DJI idle TEST] ACTIVE: capture by {}", new_reading.detail),
                     IdlePhase::Idle =>
-                        eprintln!("[DJI idle TEST] No capture; counting {} seconds", timeout_seconds()),
+                        eprintln!("[DJI idle TEST] IDLE: no capture; threshold {}s", timeout_seconds()),
                     IdlePhase::Due =>
-                        eprintln!("[DJI idle TEST] {} seconds idle: WOULD SLEEP; no USB command sent", timeout_seconds()),
+                        eprintln!("[DJI idle TEST] WOULD SLEEP after {}s; NO USB power command sent", timeout_seconds()),
+                    IdlePhase::Unknown =>
+                        eprintln!("[DJI idle TEST] UNKNOWN: {}", new_reading.detail),
                 }
-                *phase = next;
+                *current = new_reading;
             }
-            drop(phase);
+            drop(current);
             thread::sleep(Duration::from_secs(3));
         }
     }
 }
 
-/// 60s is the default test interval. Export DJI_IDLE_SECONDS=30 for fast tests;
-/// switch to 180 when we have fully validated a reversible standby mechanism.
 pub fn timeout_seconds() -> u64 {
     std::env::var("DJI_IDLE_SECONDS")
         .ok()
@@ -83,67 +107,180 @@ pub fn timeout_seconds() -> u64 {
         .unwrap_or(60)
 }
 
-fn has_dji_audio_capture() -> Result<bool, &'static str> {
-    // No audio is sampled. PipeWire provides process/link metadata via JSON.
-    let out = Command::new("pw-dump").arg("-N").output().map_err(|_| "pw-dump unavailable")?;
-    if !out.status.success() { return Err("pw-dump failed"); }
-    let graph: Vec<Value> = serde_json::from_slice(&out.stdout).map_err(|_| "bad PipeWire JSON")?;
-    has_capture_link(&graph)
+fn probe_pipewire() -> Result<Probe, String> {
+    // Process/link *metadata* only; no microphone audio samples are read.
+    let output = Command::new("pw-dump")
+        .arg("--no-colors")
+        .output()
+        .map_err(|e| format!("pw-dump unavailable: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("pw-dump exited with {}", output.status));
+    }
+    let graph: Vec<Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("invalid PipeWire JSON: {e}"))?;
+    Ok(classify_graph(&graph))
 }
 
-fn has_capture_link(graph: &[Value]) -> Result<bool, &'static str> {
-    let dji_sources: HashSet<u64> = graph.iter().filter_map(|obj| {
-        if obj.get("type")?.as_str()? != "PipeWire:Interface:Node" { return None; }
-        let id = obj.get("id")?.as_u64()?;
-        let props = obj.pointer("/info/props")?;
-        let media = props.get("media.class").and_then(Value::as_str).unwrap_or("");
+fn obj_id(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse::<u64>().ok())
+}
+
+fn prop<'a>(props: &'a Value, name: &str) -> &'a str {
+    props.get(name).and_then(Value::as_str).unwrap_or("")
+}
+
+fn consumer_name(node: &Value, clients: &HashMap<u64, &Value>) -> String {
+    let props = node.pointer("/info/props").unwrap_or(&Value::Null);
+    let client_id = props.get("client.id").and_then(obj_id);
+    let client_props = client_id
+        .and_then(|id| clients.get(&id).copied())
+        .and_then(|client| client.pointer("/info/props"))
+        .unwrap_or(&Value::Null);
+    for p in [props, client_props] {
+        for field in ["application.name", "application.process.binary", "media.name", "node.description", "node.name"] {
+            let value = prop(p, field).trim();
+            if !value.is_empty() {
+                return value.chars().take(48).collect();
+            }
+        }
+    }
+    format!("PipeWire stream #{}", node.get("id").and_then(Value::as_u64).unwrap_or(0))
+}
+
+fn classify_graph(graph: &[Value]) -> Probe {
+    let nodes: HashMap<u64, &Value> = graph.iter()
+        .filter(|o| o.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Node"))
+        .filter_map(|o| Some((o.get("id")?.as_u64()?, o)))
+        .collect();
+    let clients: HashMap<u64, &Value> = graph.iter()
+        .filter(|o| o.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Client"))
+        .filter_map(|o| Some((o.get("id")?.as_u64()?, o)))
+        .collect();
+    let dji_sources: HashSet<u64> = nodes.iter().filter_map(|(id, node)| {
+        let props = node.pointer("/info/props")?;
+        let media = prop(props, "media.class");
         if !media.starts_with("Audio/Source") { return None; }
-        let name = props.get("node.name").and_then(Value::as_str).unwrap_or("");
-        let desc = props.get("node.description").and_then(Value::as_str).unwrap_or("");
-        let joined = format!("{name} {desc}").to_ascii_lowercase();
-        let matches = joined.contains("wireless mic rx")
-            || joined.contains("wireless_mic_rx")
-            || (joined.contains("dji") && joined.contains("mic"));
-        matches.then_some(id)
+        let name = format!("{} {}", prop(props, "node.name"), prop(props, "node.description"))
+            .to_ascii_lowercase();
+        (name.contains("wireless mic rx")
+            || name.contains("wireless_mic_rx")
+            || (name.contains("dji") && name.contains("mic"))).then_some(*id)
     }).collect();
 
-    if dji_sources.is_empty() { return Err("DJI source not found"); }
-
-    // Any link to the source is interpreted as use, including paused links:
-    // conferencing apps can hold the mic open between speech segments.
-    for obj in graph {
-        if obj.get("type").and_then(Value::as_str) != Some("PipeWire:Interface:Link") { continue; }
-        let output = obj.pointer("/info/output-node-id").and_then(Value::as_u64);
-        if !output.is_some_and(|id| dji_sources.contains(&id)) { continue; }
-        let state = obj.pointer("/info/state").and_then(Value::as_str).unwrap_or("unknown");
-        if state != "error" && state != "unlinked" { return Ok(true); }
+    if dji_sources.is_empty() {
+        return Probe::Unknown("DJI source not found".into());
     }
-    Ok(false)
+
+    let mut consumers = Vec::new();
+    let mut uncertain = Vec::new();
+    for link in graph.iter()
+        .filter(|o| o.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Link"))
+    {
+        let Some(output) = link.pointer("/info/output-node-id").and_then(obj_id) else { continue };
+        if !dji_sources.contains(&output) { continue; }
+        let state = link.pointer("/info/state").and_then(Value::as_str).unwrap_or("unknown");
+        if state == "error" || state == "unlinked" { continue; }
+        let Some(input) = link.pointer("/info/input-node-id").and_then(obj_id) else {
+            uncertain.push("link has no consumer node".to_string());
+            continue;
+        };
+        let Some(node) = nodes.get(&input) else {
+            uncertain.push(format!("linked consumer node {input} is unavailable"));
+            continue;
+        };
+        let props = node.pointer("/info/props").unwrap_or(&Value::Null);
+        let media = prop(props, "media.class");
+        let category = prop(props, "media.category");
+
+        // PipeWire Audio/Source -> Stream/Input/Audio = real app capture.
+        // A muted or paused meeting may retain that stream; don't miss it.
+        if media == "Stream/Input/Audio" {
+            if category != "Monitor" {
+                consumers.push(consumer_name(node, &clients));
+            }
+            continue;
+        }
+
+        // Monitoring tools and passive graph links don't themselves mean
+        // that an application is recording the mic.
+        let link_props = link.pointer("/info/props").unwrap_or(&Value::Null);
+        let passive = matches!(prop(link_props, "link.passive"), "true" | "1");
+        if category == "Monitor" || passive {
+            continue;
+        }
+
+        // An echo-cancel/filter node may route into a real call indirectly.
+        // Until full graph traversal is implemented, fail closed.
+        uncertain.push(format!("device routed to {} ({})", consumer_name(node, &clients),
+            if media.is_empty() { "unclassified" } else { media }));
+    }
+    consumers.sort();
+    consumers.dedup();
+    if !consumers.is_empty() {
+        Probe::Active(consumers)
+    } else if !uncertain.is_empty() {
+        uncertain.sort();
+        uncertain.dedup();
+        Probe::Unknown(uncertain.join("; "))
+    } else {
+        Probe::Idle
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn detects_dji_capture_and_ignores_unrelated_links() {
-        let source = serde_json::json!({
+    fn source() -> Value {
+        serde_json::json!({
             "id": 95, "type": "PipeWire:Interface:Node",
             "info": {"props": {
                 "media.class": "Audio/Source",
                 "node.name": "alsa_input.usb-DJI_Technology_Wireless_Mic_Rx.pro-input-0"
             }}
-        });
-        let other = serde_json::json!({
-            "id": 200, "type": "PipeWire:Interface:Link",
-            "info": {"output-node-id": 45, "state": "active"}
-        });
-        let dji = serde_json::json!({
-            "id": 201, "type": "PipeWire:Interface:Link",
-            "info": {"output-node-id": 95, "state": "active"}
-        });
-        assert!(matches!(has_capture_link(&[source.clone(), other]), Ok(false)));
-        assert!(matches!(has_capture_link(&[source.clone(), dji]), Ok(true)));
-        assert!(has_capture_link(&[]).is_err());
+        })
+    }
+    fn node(id: u64, class: &str, category: &str, app: &str) -> Value {
+        serde_json::json!({
+            "id": id, "type": "PipeWire:Interface:Node",
+            "info": {"props": {
+                "media.class": class, "media.category": category,
+                "application.name": app
+            }}
+        })
+    }
+    fn link(id: u64, input: u64, passive: bool) -> Value {
+        serde_json::json!({
+            "id": id, "type": "PipeWire:Interface:Link",
+            "info": {"output-node-id": 95, "input-node-id": input,
+                     "state": "active", "props": {"link.passive": if passive { "true" } else { "false" }}}
+        })
+    }
+
+    #[test]
+    fn unlinked_source_is_idle() {
+        assert_eq!(classify_graph(&[source()]), Probe::Idle);
+    }
+    #[test]
+    fn linked_monitor_is_not_a_recording() {
+        assert_eq!(classify_graph(&[source(), node(201, "Stream/Input/Audio", "Monitor", "KDE meter"), link(301, 201, false)]), Probe::Idle);
+    }
+    #[test]
+    fn passive_internal_link_is_not_a_recording() {
+        assert_eq!(classify_graph(&[source(), node(202, "Audio/Sink", "DSP", "Passive routing"), link(302, 202, true)]), Probe::Idle);
+    }
+    #[test]
+    fn zoom_stream_is_active_even_when_muted() {
+        assert_eq!(classify_graph(&[source(), node(203, "Stream/Input/Audio", "Capture", "Zoom"), link(303, 203, false)]),
+            Probe::Active(vec!["Zoom".into()]));
+    }
+    #[test]
+    fn unknown_active_filter_route_is_not_assumed_idle() {
+        assert!(matches!(classify_graph(&[source(), node(204, "Audio/Sink", "DSP", "Echo canceller"), link(304, 204, false)]),
+            Probe::Unknown(_)));
+    }
+    #[test]
+    fn missing_dji_is_unknown() {
+        assert!(matches!(classify_graph(&[]), Probe::Unknown(_)));
     }
 }
