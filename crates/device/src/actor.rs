@@ -6,6 +6,7 @@
 //! over a channel. Because `nusb` transfers are queued rather than blocking,
 //! reads and writes coexist without the global lock a synchronous USB API needs.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,6 +87,11 @@ async fn run(
     let mut seq: u16 = 1;
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let debug = std::env::var_os("DJIMIC_DEBUG").is_some();
+    // Opt-in *metadata-only* radio-link research trace. Unlike DJIMIC_DEBUG,
+    // this never emits a packet payload, USB serial number, or live audio.
+    // Traces the first occurrence of each distinct incoming frame family.
+    let rf_trace = std::env::var("DJI_RF_TRACE").as_deref() == Ok("1");
+    let mut rf_seen_frames: HashSet<(u8, u8, u8, u8, usize, bool)> = HashSet::new();
     // Learned from the first heartbeat; defaults to v2 since a command sent
     // before any heartbeat arrives is the rare case (heartbeats stream
     // continuously as soon as the device is opened).
@@ -119,6 +125,23 @@ async fn run(
                     }
                     let previous = status.lock().unwrap().clone();
                     let new_status = model.decode(&previous, &frame);
+                    if rf_trace && frame.len() >= 12 {
+                        // Kind, cmd set/id/subtype, frame length, recognized flag.
+                        // Deliberately skip all bytes after offset 11: some
+                        // identity pushes contain TX/RX serial numbers.
+                        let signature = (
+                            frame[8], frame[9], frame[10], frame[11],
+                            frame.len(), new_status.is_some(),
+                        );
+                        if rf_seen_frames.len() < 128 && rf_seen_frames.insert(signature) {
+                            eprintln!(
+                                "[DJI RF trace] first frame kind={:?} marker={:02x}:{:02x}:{:02x} len={} decoded={} payload=redacted",
+                                packet::frame_kind(&frame),
+                                frame[9], frame[10], frame[11],
+                                frame.len(), new_status.is_some(),
+                            );
+                        }
+                    }
                     if debug {
                         eprintln!(
                             "[frame] kind={:?} decoded={} {}",
