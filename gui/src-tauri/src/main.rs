@@ -2,13 +2,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod idle;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use device::DeviceManager;
 use tauri::image::Image;
-use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
@@ -92,14 +93,18 @@ fn show_main(app: &AppHandle) {
 /// one mic connected), the current NC mode, NC power, LED state, the connected
 /// device's protocol version, and whether "Start at login" is enabled.
 /// Compared each tick so the menu is only rebuilt on change.
-type MenuState = (bool, Option<String>, Option<String>, Option<String>, Option<u8>, bool);
+type MenuState = (
+    bool, Option<String>, Option<String>, Option<String>, Option<u8>,
+    Option<i8>, idle::IdlePhase, bool,
+);
 
 /// Read the current menu-relevant state.
 fn menu_state(app: &AppHandle) -> MenuState {
     let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+    let phase = app.state::<Arc<idle::IdleMonitor>>().inner().phase();
     let mgr = app.state::<Arc<DeviceManager>>().inner().clone();
     if mgr.list().len() != 1 {
-        return (false, None, None, None, None, autostart);
+        return (false, None, None, None, None, None, phase, autostart);
     }
     match pick_device(&mgr).and_then(|id| mgr.status(&id).ok()) {
         Some(st) => (
@@ -108,16 +113,18 @@ fn menu_state(app: &AppHandle) -> MenuState {
             st.settings.get("noise-cancel-power").cloned(),
             st.settings.get("mic-leds").cloned(),
             st.protocol_version,
+            st.gain_dial,
+            phase,
             autostart,
         ),
-        None => (true, None, None, None, None, autostart),
+        None => (true, None, None, None, None, None, phase, autostart),
     }
 }
 
 /// Build the tray menu. The per-device toggles appear only when exactly one mic
 /// is connected, and their labels show the current mode and what tapping does.
 fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
-    let (show, nc, nc_power, led, protocol_version, autostart) = state;
+    let (show, nc, nc_power, led, protocol_version, gain, phase, autostart) = state;
     let open = MenuItem::with_id(app, "open", "Open DJI Mic Control", true, None::<&str>)?;
     let startup = CheckMenuItem::with_id(
         app,
@@ -130,6 +137,13 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let sep_a = PredefinedMenuItem::separator(app)?;
     let sep_b = PredefinedMenuItem::separator(app)?;
+    let idle_label = match phase {
+        idle::IdlePhase::Unknown => "Idle test: DJI source / PipeWire unavailable".to_string(),
+        idle::IdlePhase::Active => "Idle test: recording active".to_string(),
+        idle::IdlePhase::Idle => format!("Idle test: waiting ({}s threshold)", idle::timeout_seconds()),
+        idle::IdlePhase::Due => format!("Idle test: {}s reached (NO power-off)", idle::timeout_seconds()),
+    };
+    let idle_item = MenuItem::with_id(app, "idle-monitor", idle_label, false, None::<&str>)?;
 
     if *show {
         let led_label = match led.as_deref() {
@@ -159,14 +173,24 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
             .then(|| MenuItem::with_id(app, "toggle-nc-power", nc_power_label, true, None::<&str>))
             .transpose()?;
 
-        let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&open, &sep_a, &leds, &nc];
+        // KDE's native tray menu supports discrete controls, not an embedded slider.
+        let gain_m12 = CheckMenuItem::with_id(app, "gain:-12", "−12 dB", true, *gain == Some(-12), None::<&str>)?;
+        let gain_m6  = CheckMenuItem::with_id(app, "gain:-6", "−6 dB", true, *gain == Some(-6), None::<&str>)?;
+        let gain_0   = CheckMenuItem::with_id(app, "gain:0", "0 dB", true, *gain == Some(0), None::<&str>)?;
+        let gain_p6  = CheckMenuItem::with_id(app, "gain:6", "+6 dB", true, *gain == Some(6), None::<&str>)?;
+        let gain_p12 = CheckMenuItem::with_id(app, "gain:12", "+12 dB", true, *gain == Some(12), None::<&str>)?;
+        let gain_menu = Submenu::with_items(
+            app, "Receiver Gain", *protocol_version == Some(2),
+            &[&gain_m12, &gain_m6, &gain_0, &gain_p6, &gain_p12],
+        )?;
+        let mut items: Vec<&dyn IsMenuItem<Wry>> = vec![&open, &sep_a, &gain_menu, &leds, &nc];
         if let Some(item) = &nc_power_item {
             items.push(item);
         }
-        items.extend([&sep_b as &dyn IsMenuItem<Wry>, &startup, &sep_c, &quit]);
+        items.extend([&sep_b as &dyn IsMenuItem<Wry>, &idle_item, &startup, &sep_c, &quit]);
         Menu::with_items(app, &items)
     } else {
-        Menu::with_items(app, &[&open, &sep_a, &startup, &sep_b, &quit])
+        Menu::with_items(app, &[&open, &sep_a, &idle_item, &startup, &sep_b, &quit])
     }
 }
 
@@ -437,6 +461,13 @@ impl TrayIcons {
 }
 
 fn main() {
+    // Work around blank WebKitGTK windows on some NVIDIA/Wayland installations,
+    // including when autostarted without a shell environment override.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     // On SIGTERM/SIGINT (logout, shutdown, Ctrl-C) exit via quit_now() so the
     // WebKit helpers are killed rather than crashing in their GL teardown. This
     // keeps the accelerated DMABUF renderer (full frame rate) without the noisy
@@ -477,7 +508,14 @@ fn main() {
             Some(vec!["--hidden"]),
         ))
         .manage(manager)
+        .manage(Arc::new(idle::IdleMonitor::new()))
         .setup(move |app| {
+            // This monitor reads PipeWire metadata only; never touches USB power.
+            #[cfg(target_os = "linux")]
+            {
+                let idle = app.state::<Arc<idle::IdleMonitor>>().inner().clone();
+                std::thread::spawn(move || idle.run_forever());
+            }
             // Set the window icon explicitly so the titlebar and taskbar show it
             // even when the desktop-file association is unavailable (e.g. X11).
             if let Some(window) = app.get_webview_window("main") {
@@ -519,6 +557,17 @@ fn main() {
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_main(app),
+                    gain @ ("gain:-12" | "gain:-6" | "gain:0" | "gain:6" | "gain:12") => {
+                        let db = gain.strip_prefix("gain:").unwrap_or_default().to_string();
+                        let mgr = app.state::<Arc<DeviceManager>>().inner().clone();
+                        std::thread::spawn(move || {
+                            if let Some(id) = pick_device(&mgr) {
+                                if let Err(e) = mgr.set(&id, "receiver-gain", &db) {
+                                    eprintln!("DJI receiver gain write failed: {e}");
+                                }
+                            }
+                        });
+                    }
                     "toggle-leds" => {
                         let mgr = app.state::<Arc<DeviceManager>>().inner().clone();
                         std::thread::spawn(move || toggle_between(&mgr, "mic-leds", "on", "off"));

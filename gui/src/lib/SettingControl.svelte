@@ -13,6 +13,7 @@
     onchange,
   } = $props();
 
+  const isGain = $derived(setting.id === "receiver-gain");
   const isToggle = $derived(setting.kind === "toggle");
   const onValue = $derived(setting.options[1]?.value);
   const checked = $derived(value === onValue);
@@ -43,6 +44,21 @@
   <div class="control" class:dim={locked}>
     {#if value === null}
       <span class="unknown">—</span>
+    {:else if isGain}
+      <div class="gain-slider">
+        <input
+          class="gain-range"
+          type="range"
+          min="-12"
+          max="12"
+          step="6"
+          value={value}
+          disabled={disabled}
+          aria-label="Receiver gain (dB)"
+          onchange={(event) => choose(event.currentTarget.value)}
+        />
+        <span class="gain-readout">{Number(value) > 0 ? "+" : ""}{value} dB</span>
+      </div>
     {:else if isToggle}
       <button
         class="switch"
@@ -168,6 +184,25 @@
     transform: translateX(15px);
   }
 
+  /* Five-step hardware receiver gain, not a software audio slider. */
+  .gain-slider {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    min-width: 0;
+  }
+  .gain-range { width: 180px; accent-color: var(--accent); cursor: pointer; }
+  .gain-range:disabled { cursor: default; }
+  .gain-readout {
+    min-width: 58px;
+    text-align: right;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .compact .gain-slider { gap: 6px; }
+  .compact .gain-range { width: 115px; }
   /* Segmented */
   .segmented {
     display: inline-flex;
